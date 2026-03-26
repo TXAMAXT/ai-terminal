@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 备份文件
+*.bak
+skills.json.bak.*
+
+# 临时文件
+*.tmp
+*.swp
+*~
+
+# IDE
+.idea/
+.vscode/
+*.sublime-*
+
+# 系统文件
+.DS_Store
+Thumbs.db
