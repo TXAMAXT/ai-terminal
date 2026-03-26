@@ -6,6 +6,8 @@ import json
 import argparse
 import time
 import sys
+import random
+import string
 from typing import Any, Dict, List, Optional, Tuple
 
 import faiss
@@ -22,6 +24,13 @@ REQUEST_TIMEOUT_SEC = 60
 # --- Tunables ---
 SEARCH_THRESHOLD_DEFAULT = 0.85
 DEDUP_BY_TRIGGER_THRESHOLD = 0.92
+DELETE_MATCH_THRESHOLD = 0.75  # 删除时语义匹配阈值
+
+
+def generate_id(length: int = 6) -> str:
+    """生成随机 ID，如 'a1b2c3'"""
+    chars = string.ascii_lowercase + string.digits
+    return ''.join(random.choice(chars) for _ in range(length))
 
 
 def load_config() -> Dict[str, Any]:
@@ -81,7 +90,23 @@ def backup_skills() -> str:
     if os.path.exists(SKILL_FILE):
         with open(SKILL_FILE, "rb") as src, open(bak, "wb") as dst:
             dst.write(src.read())
+
+    # 自动清理旧备份，只保留最近 5 个
+    cleanup_old_backups(keep=5)
+
     return bak
+
+
+def cleanup_old_backups(keep: int = 5) -> None:
+    """清理旧备份文件，只保留最近的 N 个"""
+    import glob
+    pattern = f"{SKILL_FILE}.bak.*"
+    backups = sorted(glob.glob(pattern), reverse=True)  # 按时间倒序
+    for old_bak in backups[keep:]:
+        try:
+            os.remove(old_bak)
+        except OSError:
+            pass
 
 
 def restore_backup(bak_path: str) -> None:
@@ -126,8 +151,15 @@ def migrate_skills_inplace(skills: List[Dict[str, Any]]) -> bool:
 
     ids = [x.get("id") for x in skills]
     if any(i is None for i in ids) or len(set([i for i in ids if i is not None])) != len([i for i in ids if i is not None]):
-        for i, s in enumerate(skills, start=1):
-            s["id"] = i
+        existing_ids = set(i for i in ids if i is not None)
+        for s in skills:
+            if s.get("id") is None:
+                # 生成不重复的随机 ID
+                new_id = generate_id()
+                while new_id in existing_ids:
+                    new_id = generate_id()
+                s["id"] = new_id
+                existing_ids.add(new_id)
         changed = True
 
     return changed
@@ -218,10 +250,6 @@ def dedupe_by_command(skills: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
 
             changed = True
 
-    if changed:
-        for i, s in enumerate(kept, start=1):
-            s["id"] = i
-
     return kept, changed
 
 
@@ -299,7 +327,53 @@ def search_skill(query: str, threshold: float = SEARCH_THRESHOLD_DEFAULT, topk: 
     return results
 
 
-def add_skill(trigger: str, command: str, effect: str = "") -> Tuple[str, int]:
+def check_skill_status(trigger: str, command: str) -> Tuple[str, Optional[str]]:
+    """
+    预览技能状态（不保存）：
+    返回：
+      - 'will_merge', skill_id：将合并到已有技能（命令相同）
+      - 'will_skip', skill_id：触发语和命令都相同，跳过新增
+      - 'similar_trigger', skill_id：触发语相似但命令不同，提示用户
+      - 'will_add', None：将新增技能
+    """
+    trigger = (trigger or "").strip()
+    command = (command or "").strip()
+
+    skills, _ = dedupe_skills()
+
+    # 同 command 将合并触发语
+    if command:
+        for s in skills:
+            if (s.get("command") or "").strip() == command:
+                triggers = [t.strip() for t in s.get("triggers", []) if isinstance(t, str) and t.strip()]
+                if trigger and trigger not in triggers:
+                    return "will_merge", str(s["id"])
+                return "merged_no_change", str(s["id"])
+
+    # trigger 高度重复但命令不同：提示用户选择
+    if trigger:
+        hit = search_skill(trigger, threshold=DEDUP_BY_TRIGGER_THRESHOLD, topk=1)
+        if hit:
+            s, _ = hit[0]
+            # 命令不同，让用户决定是否保存
+            return "similar_trigger", str(s["id"])
+
+    return "will_add", None
+
+
+def add_skill(trigger: str, command: str, effect: str = "", force: bool = False) -> Tuple[str, str]:
+    """
+    添加或合并技能
+
+    Args:
+        trigger: 触发语
+        command: 命令
+        effect: 效果描述
+        force: 强制添加，跳过触发语重复检查
+
+    Returns:
+        (status, id) - status: added/merged/skipped
+    """
     trigger = (trigger or "").strip()
     command = (command or "").strip()
     effect = (effect or "").strip()
@@ -322,19 +396,26 @@ def add_skill(trigger: str, command: str, effect: str = "") -> Tuple[str, int]:
                 if changed:
                     # triggers 变了就重算当前 embedding（同 model）
                     reembed_all(skills, force=False)
-                return "merged", int(s["id"])
+                return "merged", str(s["id"])
 
-    # trigger 高度重复则跳过新增（避免污染）
-    if trigger:
+    # trigger 高度重复则跳过新增（除非 force=True）
+    if trigger and not force:
         hit = search_skill(trigger, threshold=DEDUP_BY_TRIGGER_THRESHOLD, topk=1)
         if hit:
             s, _ = hit[0]
-            return "skipped", int(s["id"])
+            return "skipped", str(s["id"])
 
     # 新增
     cur_model = current_embed_model()
+
+    # 生成不重复的随机 ID
+    existing_ids = set(s.get("id") for s in skills)
+    new_id = generate_id()
+    while new_id in existing_ids:
+        new_id = generate_id()
+
     new_skill = {
-        "id": len(skills) + 1,
+        "id": new_id,
         "triggers": [trigger] if trigger else [],
         "command": command,
         "effect": effect,
@@ -347,24 +428,131 @@ def add_skill(trigger: str, command: str, effect: str = "") -> Tuple[str, int]:
         new_skill["embedding"] = get_embedding(text, model=cur_model).tolist()
 
     skills.append(new_skill)
-    for i, s in enumerate(skills, start=1):
-        s["id"] = i
 
     save_skills_atomic(skills)
-    return "added", int(new_skill["id"])
+    return "added", str(new_skill["id"])
 
 
-def set_effect(skill_id: int, effect: str) -> bool:
+def set_effect(skill_id: str, effect: str) -> bool:
     skills, _ = dedupe_skills()
     changed = False
     for s in skills:
-        if int(s.get("id", -1)) == int(skill_id):
+        if str(s.get("id", "")) == str(skill_id):
             s["effect"] = (effect or "").strip()
             changed = True
             break
     if changed:
         save_skills_atomic(skills)
     return changed
+
+
+def list_skills(limit: int = 50) -> List[Dict[str, Any]]:
+    """列出所有技能"""
+    skills, _ = dedupe_skills()
+    return skills[:limit] if limit > 0 else skills
+
+
+def get_skill_command(skill_id: str) -> Optional[str]:
+    """根据 ID 获取技能命令"""
+    skills, _ = dedupe_skills()
+    for s in skills:
+        if str(s.get("id", "")) == skill_id:
+            return s.get("command", "")
+    return None
+
+
+def search_for_delete(query: str, topk: int = 5) -> List[Tuple[Dict[str, Any], float]]:
+    """
+    搜索匹配的技能（用于删除前确认）
+    返回匹配列表：[(skill, score), ...]
+    """
+    skills, _ = dedupe_skills()
+    query = query.strip()
+
+    if not query:
+        return []
+
+    results = []
+
+    # 1. 精确命令匹配
+    for s in skills:
+        if (s.get("command") or "").strip() == query:
+            results.append((s, 1.0))
+            return results  # 精确匹配直接返回
+
+    # 2. ID 匹配
+    for s in skills:
+        if str(s.get("id", "")) == query:
+            results.append((s, 1.0))
+            return results
+
+    # 3. 触发语精确匹配
+    for s in skills:
+        triggers = [t.strip() for t in s.get("triggers", []) if isinstance(t, str)]
+        if query in triggers:
+            results.append((s, 1.0))
+            return results
+
+    # 4. 语义匹配
+    hit = search_skill(query, threshold=DELETE_MATCH_THRESHOLD, topk=topk)
+    if hit:
+        return hit
+
+    return results
+
+
+def delete_by_id(skill_id: str) -> Tuple[bool, str]:
+    """根据 ID 删除技能"""
+    skills, _ = dedupe_skills()
+    for s in skills:
+        if str(s.get("id", "")) == skill_id:
+            cmd = s.get("command", "")
+            skills.remove(s)
+            save_skills_atomic(skills)
+            return True, f"已删除: {cmd}"
+    return False, f"未找到 ID: {skill_id}"
+
+
+def delete_skill(query: str) -> Tuple[bool, str]:
+    """
+    删除技能，支持多种匹配方式：
+    1. 精确命令匹配：delete "ls -la"
+    2. 语义匹配：delete "查看文件"
+    3. ID 匹配：delete "a1b2c3"
+
+    返回：(是否成功, 消息)
+    """
+    skills, _ = dedupe_skills()
+    query = query.strip()
+
+    if not query:
+        return False, "请提供要删除的技能（命令、触发语或 ID）"
+
+    # 1. 尝试精确命令匹配
+    for s in skills:
+        if (s.get("command") or "").strip() == query:
+            skills.remove(s)
+            save_skills_atomic(skills)
+            return True, f"已删除命令: {query}"
+
+    # 2. 尝试 ID 匹配
+    for s in skills:
+        if str(s.get("id", "")) == query:
+            cmd = s.get("command", "")
+            skills.remove(s)
+            save_skills_atomic(skills)
+            return True, f"已删除 ID {query}: {cmd}"
+
+    # 3. 尝试语义匹配
+    hit = search_skill(query, threshold=DELETE_MATCH_THRESHOLD, topk=1)
+    if hit:
+        s, score = hit[0]
+        cmd = s.get("command", "")
+        skills.remove(s)
+        save_skills_atomic(skills)
+        return True, f"已删除（匹配度 {score:.2f}）: {cmd}"
+
+    return False, f"未找到匹配的技能: {query}"
 
 
 def main():
@@ -380,10 +568,31 @@ def main():
     p_add.add_argument("trigger", type=str)
     p_add.add_argument("command", type=str)
     p_add.add_argument("--effect", type=str, default="")
+    p_add.add_argument("--force", action="store_true", help="force add even if trigger is similar")
+
+    p_check = sub.add_parser("check", help="preview skill status without saving")
+    p_check.add_argument("trigger", type=str)
+    p_check.add_argument("command", type=str)
 
     p_set = sub.add_parser("set-effect", help="set effect text for a skill id")
-    p_set.add_argument("id", type=int)
+    p_set.add_argument("id", type=str)
     p_set.add_argument("effect", type=str)
+
+    p_list = sub.add_parser("list", help="list all skills")
+    p_list.add_argument("--limit", type=int, default=50, help="max number of skills to show")
+
+    p_search_del = sub.add_parser("search-delete", help="search skills for deletion")
+    p_search_del.add_argument("query", type=str, nargs="+", help="search query")
+    p_search_del.add_argument("--topk", type=int, default=5)
+
+    p_del_id = sub.add_parser("delete-id", help="delete skill by id")
+    p_del_id.add_argument("id", type=str, help="skill id to delete")
+
+    p_delete = sub.add_parser("delete", help="delete a skill by command, trigger, or id (legacy)")
+    p_delete.add_argument("query", type=str, nargs="*", help="command, trigger phrase, or skill id to delete")
+
+    p_get_cmd = sub.add_parser("get-cmd", help="get command by skill id")
+    p_get_cmd.add_argument("id", type=str, help="skill id")
 
     sub.add_parser("dedupe", help="dedupe skills.json by command and auto-reembed when embed_model changes")
 
@@ -403,14 +612,62 @@ def main():
             print(f"{i}\t{cmd}\t{score:.4f}\t{sid}\t{eff}")
         return
 
+    if args.cmd == "check":
+        status, sid = check_skill_status(args.trigger, args.command)
+        print(f"{status} {sid if sid else ''}")
+        return
+
     if args.cmd == "add":
-        status, sid = add_skill(args.trigger, args.command, args.effect)
+        status, sid = add_skill(args.trigger, args.command, args.effect, force=args.force)
         print(f"{status} {sid}")
         return
 
     if args.cmd == "set-effect":
         ok = set_effect(args.id, args.effect)
         print("ok" if ok else "nochange")
+        return
+
+    if args.cmd == "list":
+        skills = list_skills(limit=args.limit)
+        if not skills:
+            print("没有技能")
+            return
+        print(f"共 {len(skills)} 个技能：")
+        print("-" * 60)
+        for s in skills:
+            cmd = (s.get("command") or "").replace("\n", " ")
+            triggers = ", ".join(s.get("triggers", [])[:3])
+            print(f"• {cmd}")
+            print(f"  触发语: {triggers}")
+        return
+
+    if args.cmd == "search-delete":
+        query = " ".join(args.query)
+        results = search_for_delete(query, topk=args.topk)
+        if not results:
+            print("not_found")
+            return
+        for i, (s, score) in enumerate(results, start=1):
+            cmd = (s.get("command") or "").replace("\t", " ")
+            sid = s.get("id", "")
+            print(f"{i}\t{sid}\t{score:.4f}\t{cmd}")
+        return
+
+    if args.cmd == "delete-id":
+        ok, msg = delete_by_id(args.id)
+        print(msg)
+        return
+
+    if args.cmd == "delete":
+        query = " ".join(args.query)
+        ok, msg = delete_skill(query)
+        print(msg)
+        return
+
+    if args.cmd == "get-cmd":
+        cmd = get_skill_command(args.id)
+        if cmd:
+            print(cmd)
         return
 
     if args.cmd == "dedupe":

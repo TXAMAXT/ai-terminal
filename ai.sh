@@ -4,6 +4,39 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR" || exit 1
 
+# ====================================
+# 危险命令黑名单检测
+# ====================================
+is_dangerous_cmd() {
+  local cmd="$1"
+  # 危险模式列表
+  local patterns=(
+    "rm[[:space:]]+(-[rf]+|--no-preserve-root)[[:space:]]*/"
+    "rm[[:space:]]+-rf[[:space:]]+/\*"
+    "mkfs"
+    "dd[[:space:]]+if="
+    ":[[:space:]]*\(\)[[:space:]]*\{[[:space:]]*:[[:space:]]*\|[[:space:]]*:[[:space:]]*&[[:space:]]*\}"
+    ">[[:space:]]*/dev/sd[a-z]"
+    "chmod[[:space:]]+-R[[:space:]]+777[[:space:]]+/"
+    "chown[[:space:]]+-R[[:space:]]+.+[[:space:]]+/"
+    "shutdown"
+    "reboot"
+    "init[[:space:]]+[06]"
+    "systemctl[[:space:]]+(stop|disable|mask)[[:space:]]+ssh"
+    "iptables[[:space:]]+-F"
+    "ufw[[:space:]]+disable"
+    "curl.*\|[[:space:]]*bash"
+    "wget.*\|[[:space:]]*bash"
+  )
+
+  for pattern in "${patterns[@]}"; do
+    if echo "$cmd" | grep -qiE "$pattern"; then
+      return 0  # 是危险命令
+    fi
+  done
+  return 1  # 安全
+}
+
 # 读取 chat_model（没有就默认）
 MODEL="$(python3 - <<'PY'
 import json, os
@@ -21,11 +54,72 @@ PY
 USER_INPUT="${*:-}"
 if [[ -z "$USER_INPUT" ]]; then
   echo "用法：ai <你的需求>"
+  echo "      ai skill                    # 列出所有技能"
+  echo "      ai delete <命令|触发语|ID>   # 删除匹配的技能"
   exit 1
 fi
 
 # ====================================
-# ① TopK 候选 Skill
+# ① 内置命令处理
+# ====================================
+# 列出技能
+if [[ "$USER_INPUT" == "skill" || "$USER_INPUT" == "skills" ]]; then
+  python3 "$SCRIPT_DIR/skill_manager.py" list
+  exit 0
+fi
+
+# 删除技能（支持命令、触发语或 ID）
+if [[ "$USER_INPUT" == delete* ]]; then
+  DEL_QUERY="$(echo "$USER_INPUT" | sed 's/^delete[[:space:]]*//')"
+  if [[ -z "$DEL_QUERY" ]]; then
+    echo "用法：ai delete <命令|触发语|ID>"
+    echo "示例："
+    echo "  ai delete ls -la"
+    echo "  ai delete 帮我执行top命令"
+    echo "  ai delete a1b2c3"
+    exit 1
+  fi
+
+  # 搜索匹配的技能
+  SEARCH_RESULT="$(python3 "$SCRIPT_DIR/skill_manager.py" search-delete -- "$DEL_QUERY" 2>/dev/null || true)"
+
+  if [[ -z "$SEARCH_RESULT" || "$SEARCH_RESULT" == "not_found" ]]; then
+    echo "未找到匹配的技能"
+    exit 1
+  fi
+
+  # 显示匹配结果
+  echo ""
+  echo "🔍 找到以下匹配的技能："
+  echo ""
+
+  while IFS=$'\t' read -r IDX SID SCORE CMD; do
+    [[ -z "${IDX:-}" ]] && continue
+    echo "[$IDX] (匹配度=$SCORE) $CMD"
+  done <<< "$SEARCH_RESULT"
+
+  echo ""
+  read -r -p "请选择要删除的技能编号（回车取消）： " PICK
+
+  if [[ -z "${PICK:-}" ]]; then
+    echo "已取消"
+    exit 0
+  fi
+
+  # 获取选中技能的 ID
+  DEL_ID="$(awk -F'\t' -v p="$PICK" '$1==p {print $2; exit}' <<< "$SEARCH_RESULT")"
+
+  if [[ -z "$DEL_ID" ]]; then
+    echo "无效的选择"
+    exit 1
+  fi
+
+  python3 "$SCRIPT_DIR/skill_manager.py" delete-id "$DEL_ID"
+  exit $?
+fi
+
+# ====================================
+# ② TopK 候选 Skill
 # 每行：idx<TAB>command<TAB>score<TAB>id<TAB>effect
 # ====================================
 TOPK=5
@@ -57,6 +151,17 @@ if [[ -n "$SEARCH_OUT" ]]; then
   if [[ -n "${PICK:-}" && "$PICK" != "0" ]]; then
     PICK_CMD="$(awk -F'\t' -v p="$PICK" '$1==p {print $2; exit}' <<< "$SEARCH_OUT")"
     if [[ -n "${PICK_CMD:-}" ]]; then
+      # 安全检查
+      if is_dangerous_cmd "$PICK_CMD"; then
+        echo ""
+        echo "⚠️  警告：检测到危险命令！"
+        echo "命令：$PICK_CMD"
+        read -r -p "确定要执行吗？(yes/no): " DANGER_CONFIRM
+        if [[ "${DANGER_CONFIRM:-}" != "yes" ]]; then
+          echo "已取消"
+          exit 0
+        fi
+      fi
       echo ""
       echo "▶ 执行：$PICK_CMD"
       echo ""
@@ -69,7 +174,7 @@ if [[ -n "$SEARCH_OUT" ]]; then
 fi
 
 # ====================================
-# ② 调用模型生成命令（中文解释 + 英文命令）
+# ③ 调用模型生成命令（中文解释 + 英文命令）
 # 用 heredoc 构造 PROMPT，避免引号地狱
 # ====================================
 PROMPT="$(cat <<EOF
@@ -108,13 +213,8 @@ CMD="$(awk '
   }
 ' <<< "$RESPONSE")"
 
-# 清洗：去代码块/反引号/“或者”只取第一条/取第一行
-CMD="$(sed 's/^[[:space:]]*//;s/[[:space:]]*$//' <<< "$CMD")"
-CMD="$(sed 's/```//g' <<< "$CMD")"
-CMD="$(tr -d '\`' <<< "$CMD")"
-CMD="$(awk -F '或者' '{print $1}' <<< "$CMD")"
-CMD="$(head -n 1 <<< "$CMD")"
-CMD="$(sed 's/^[[:space:]]*//;s/[[:space:]]*$//' <<< "$CMD")"
+# 清洗：去代码块/反引号/”或者”只取第一条/取第一行/去首尾空白
+CMD="$(echo "$CMD" | sed 's/```//g; s/`//g' | awk -F'或者' '{print $1}' | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
 
 # 兜底：如果还空，就取第一条像命令的行
 if [[ -z "$CMD" ]]; then
@@ -126,9 +226,25 @@ if [[ -z "$CMD" ]]; then
   exit 1
 fi
 
+# 安全检查（在用户确认后进行二次确认）
+if is_dangerous_cmd "$CMD"; then
+  echo ""
+  echo "⚠️  警告：检测到危险命令！"
+  echo "命令：$CMD"
+fi
+
 read -r -p "是否执行？(y/n): " CONFIRM
 if [[ "${CONFIRM:-}" != "y" ]]; then
   exit 0
+fi
+
+# 危险命令二次确认
+if is_dangerous_cmd "$CMD"; then
+  read -r -p "⚠️  这是危险命令，确定要执行吗？(yes/no): " DANGER_CONFIRM
+  if [[ "${DANGER_CONFIRM:-}" != "yes" ]]; then
+    echo "已取消"
+    exit 0
+  fi
 fi
 
 echo ""
@@ -136,7 +252,7 @@ eval "$CMD"
 STATUS=$?
 
 # ====================================
-# ③ 失败分析
+# ④ 失败分析
 # ====================================
 if [[ $STATUS -ne 0 ]]; then
   echo ""
@@ -156,29 +272,76 @@ EOF
 fi
 
 # ====================================
-# ④ 成功后：自动合并/新增 skill
+# ⑤ 成功后：预览技能状态（不保存）
 # ====================================
-ADD_OUT="$(python3 "$SCRIPT_DIR/skill_manager.py" add "$USER_INPUT" "$CMD" 2>/dev/null || true)"
-ADD_STATUS="$(awk '{print $1}' <<< "$ADD_OUT")"
-ADD_ID="$(awk '{print $2}' <<< "$ADD_OUT")"
+CHECK_OUT="$(python3 "$SCRIPT_DIR/skill_manager.py" check "$USER_INPUT" "$CMD" 2>/dev/null || true)"
+CHECK_STATUS="$(awk '{print $1}' <<< "$CHECK_OUT")"
+CHECK_ID="$(awk '{print $2}' <<< "$CHECK_OUT")"
 
-if [[ "$ADD_STATUS" == "merged" ]]; then
-  echo "✅ 已合并到已有技能（追加触发语/必要时自动重算 embedding）"
+if [[ "$CHECK_STATUS" == "will_merge" ]]; then
+  echo "✅ 将合并到已有技能（追加触发语）"
+  read -r -p "确认保存？(y/n): " SAVE_SKILL
+  if [[ "${SAVE_SKILL:-}" != "y" ]]; then
+    echo "已取消"
+    exit 0
+  fi
+  python3 "$SCRIPT_DIR/skill_manager.py" add "$USER_INPUT" "$CMD" >/dev/null 2>&1
+  echo "✅ 已合并"
   exit 0
 fi
 
-if [[ "$ADD_STATUS" == "skipped" ]]; then
-  echo "⚠ 触发语与已有技能高度重复，已跳过新增"
+if [[ "$CHECK_STATUS" == "merged_no_change" ]]; then
+  echo "ℹ️ 触发语已存在于该命令的技能中，无需保存"
   exit 0
 fi
 
-read -r -p "是否保存为技能？(y/n): " SAVE_SKILL
-if [[ "${SAVE_SKILL:-}" != "y" ]]; then
+if [[ "$CHECK_STATUS" == "will_skip" ]]; then
+  echo "⚠ 触发语与已有技能高度重复，跳过保存"
   exit 0
+fi
+
+# 标记是否已确认保存
+SAVE_CONFIRMED="no"
+
+if [[ "$CHECK_STATUS" == "similar_trigger" ]]; then
+  # 触发语相似但命令不同，让用户选择
+  EXISTING_CMD="$(python3 "$SCRIPT_DIR/skill_manager.py" get-cmd "$CHECK_ID" 2>/dev/null || true)"
+  echo "⚠ 检测到相似触发语，但命令不同："
+  echo "  已有命令: $EXISTING_CMD"
+  echo "  当前命令: $CMD"
+  read -r -p "是否保存为新技能？(y/n): " SAVE_SKILL
+  if [[ "${SAVE_SKILL:-}" != "y" ]]; then
+    echo "已取消"
+    exit 0
+  fi
+  SAVE_CONFIRMED="yes"
+fi
+
+# will_add：询问是否保存；similar_trigger 已确认则跳过询问
+if [[ "$SAVE_CONFIRMED" != "yes" ]]; then
+  read -r -p "是否保存为技能？(y/n): " SAVE_SKILL
+  if [[ "${SAVE_SKILL:-}" != "y" ]]; then
+    exit 0
+  fi
 fi
 
 DESC="$(printf "%s" "用一句中文说明下面命令的作用（命令保持英文，不要加代码块）：$CMD" | ollama run "$MODEL")"
-python3 "$SCRIPT_DIR/skill_manager.py" set-effect "$ADD_ID" "$DESC" >/dev/null 2>&1 || true
 
-echo "✅ 技能已保存（id=$ADD_ID）"
+# 如果是 similar_trigger 确认的，使用 --force 强制添加
+if [[ "$SAVE_CONFIRMED" == "yes" ]]; then
+  ADD_OUT="$(python3 "$SCRIPT_DIR/skill_manager.py" add "$USER_INPUT" "$CMD" --effect "$DESC" --force 2>/dev/null || true)"
+else
+  ADD_OUT="$(python3 "$SCRIPT_DIR/skill_manager.py" add "$USER_INPUT" "$CMD" --effect "$DESC" 2>/dev/null || true)"
+fi
+
+ADD_STATUS="$(awk '{print $1}' <<< "$ADD_OUT")"
+ADD_ID="$(awk '{print $2}' <<< "$ADD_OUT")"
+
+if [[ "$ADD_STATUS" == "skipped" ]]; then
+  echo "⚠ 触发语与已有技能高度重复，未保存"
+elif [[ "$ADD_STATUS" == "merged" ]]; then
+  echo "✅ 已合并到已有技能（id=$ADD_ID）"
+else
+  echo "✅ 技能已保存（id=$ADD_ID）"
+fi
 exit 0

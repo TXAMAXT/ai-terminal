@@ -1,101 +1,160 @@
-# 🧠 AI 终端助手完整安装与使用教程
+# AI 终端助手
+
+一个完全本地运行的 AI 终端助手，基于 Ollama + 千问模型，支持自然语言生成 Linux 命令，并具备技能记忆系统。
 
 ---
 
-# 一、项目简介
+## 功能特性
 
-本项目是一个完全本地运行的 AI 终端助手，基于：
-
-- Ollama
-- 本地大模型（如 qwen2.5）
-- 向量检索（FAISS）
-- Bash Shell
-
-它不仅可以：
-
-- 自然语言生成 Linux 命令
-- 执行前确认
-- 支持交互式命令（top / vim / less 等）
-- 执行失败自动分析
-
-还具备：
-
-- 技能（Skill）记忆系统
-- 语义向量匹配
-- TopK 候选技能选择
-- 自动去重
-- embedding 模型自动升级
-- 失败自动回滚保护
+- **自然语言生成命令**：用中文描述需求，自动生成 Linux 命令
+- **技能记忆系统**：保存常用命令，语义匹配自动调用
+- **安全防护**：危险命令检测，二次确认机制
+- **交互命令支持**：支持 top / vim / less 等交互式命令
+- **执行失败分析**：自动分析失败原因并给出建议
+- **完全本地运行**：无需联网
 
 ---
 
-# 二、环境要求
+## 环境要求
 
 - Linux（推荐 Ubuntu 22.04+）
-- Bash
 - Python 3.10+
-- 内存 ≥ 8GB（推荐 16GB）
-- 已安装 Ollama
+- Ollama
 
 ---
 
-# 三、安装步骤
+## 安装
 
-## 1️⃣ 安装 Ollama
+### 1. 安装 Ollama
 
 ```bash
 curl -fsSL https://ollama.com/install.sh | sh
 ```
 
-验证：
+### 2. 下载模型
 
 ```bash
-ollama --version
-```
-
----
-
-## 2️⃣ 下载模型
-
-### 下载对话模型
-
-```bash
+# 对话模型
 ollama pull qwen2.5:7b
-```
 
-### 下载 embedding 模型
-
-```bash
+# 向量模型
 ollama pull nomic-embed-text
 ```
 
----
-
-## 3️⃣ 安装 Python 依赖
+### 3. 安装 Python 依赖
 
 ```bash
 pip install faiss-cpu numpy requests
 ```
 
----
-
-## 4️⃣ 创建项目目录
+### 4. 配置
 
 ```bash
 mkdir -p ~/ai-terminal
 cd ~/ai-terminal
+
+# 下载文件
+# ai.sh, skill_manager.py, skills.json, config.json
+
+chmod +x ai.sh
 ```
 
-将以下文件放入该目录：
+### 5. 添加别名
 
-- ai.sh
-- skill_manager.py
-- skills.json
-- config.json
+```bash
+echo 'alias ai="~/ai-terminal/ai.sh"' >> ~/.bashrc
+source ~/.bashrc
+```
 
 ---
 
-## 5️⃣ config.json 示例
+## 使用
+
+### 基本用法
+
+```bash
+ai 列出当前目录文件
+ai 查看系统进程
+ai 查看磁盘空间
+```
+
+### 技能管理
+
+```bash
+# 列出所有技能
+ai skill
+
+# 删除技能（支持命令、触发语或 ID）
+ai delete ls -la
+ai delete 帮我执行top命令
+ai delete a1b2c3
+```
+
+删除时会显示匹配结果，让用户确认后执行：
+
+```
+🔍 找到以下匹配的技能：
+
+[1] (匹配度=1.0000) ls
+
+请选择要删除的技能编号（回车取消）：
+```
+
+### 执行流程
+
+1. **技能匹配**：语义搜索已有技能，展示 TopK 候选
+2. **命令生成**：若无匹配，调用 LLM 生成命令
+3. **安全检查**：检测危险命令（如 `rm -rf /`）
+4. **用户确认**：执行前确认，危险命令二次确认
+5. **技能保存**：成功后可选择保存为技能
+
+### 安全特性
+
+危险命令检测黑名单：
+
+- `rm -rf /`、`rm -rf /*`
+- `mkfs`、`dd if=`
+- `curl | bash`、`wget | bash`
+- `chmod -R 777 /`
+
+检测到危险命令时：
+
+```
+⚠️  警告：检测到危险命令！
+命令：rm -rf /tmp
+是否执行？(y/n): y
+⚠️  这是危险命令，确定要执行吗？(yes/no): yes
+```
+
+---
+
+## 技能系统
+
+### 技能结构
+
+```json
+{
+  "id": "a1b2c3",
+  "triggers": ["列出目录文件", "查看当前目录"],
+  "command": "ls -la",
+  "effect": "列出当前目录下所有文件",
+  "embedding_model": "nomic-embed-text",
+  "embedding": [...]
+}
+```
+
+### 特性
+
+- **随机 ID**：6 位字母数字，永不重复
+- **语义匹配**：基于向量相似度检索
+- **智能合并**：相同命令自动合并触发语
+- **差异提示**：触发语相似但命令不同时提示用户选择
+
+---
+
+## 配置
+
+### config.json
 
 ```json
 {
@@ -104,207 +163,38 @@ cd ~/ai-terminal
 }
 ```
 
+### 切换模型
+
+修改 `embed_model` 后，系统自动重新计算所有技能的向量。
+
 ---
 
-## 6️⃣ 添加执行权限
+## 架构
+
+```
+用户输入 → ai.sh → skill_manager.py → Ollama API → FAISS 检索 → 执行命令
+```
+
+---
+
+## 常见问题
+
+### Q: 如何查看已有技能？
 
 ```bash
-chmod +x ~/ai-terminal/ai.sh
+ai skill
 ```
 
----
-
-## 7️⃣ 添加命令别名
-
-编辑 ~/.bashrc：
+### Q: 如何删除技能？
 
 ```bash
-alias ai="~/ai-terminal/ai.sh"
+ai delete <命令|触发语|ID>
 ```
 
-刷新配置：
+### Q: 如何切换模型？
 
-```bash
-source ~/.bashrc
-```
+修改 `config.json` 中的 `chat_model` 或 `embed_model`。
 
----
+### Q: 危险命令如何处理？
 
-# 四、使用教程
-
----
-
-## 1️⃣ 基本使用
-
-```bash
-ai 列出当前目录文件
-```
-
-系统流程：
-
-1. 语义匹配已有技能
-2. 若命中 → 展示 TopK 候选
-3. 选择执行
-4. 若未命中 → 调用模型生成命令
-5. 执行前确认
-
----
-
-## 2️⃣ TopK 候选示例
-
-```bash
-ai 查看系统进程
-```
-
-输出示例：
-
-```
-🧠 命中候选技能：
-
-[1] top
-[2] ps aux
-```
-
-选择编号即可执行。
-
----
-
-## 3️⃣ 交互命令支持
-
-```bash
-ai 实时查看CPU占用
-```
-
-将进入：
-
-```
-top
-```
-
-退出按 `q`
-
----
-
-## 4️⃣ 出错自动分析
-
-```bash
-ai 删除不存在的文件
-```
-
-若命令失败：
-
-- 自动捕获退出码
-- 调用模型分析原因
-- 中文解释解决方案
-
----
-
-## 5️⃣ 技能自动保存
-
-执行成功后：
-
-```
-是否保存为技能？(y/n)
-```
-
-保存后：
-
-- 触发语加入向量库
-- 下次语义相近时自动命中
-
----
-
-# 五、技能系统说明
-
-每个技能包含：
-
-```json
-{
-  "id": 1,
-  "triggers": ["列出目录文件"],
-  "command": "ls",
-  "effect": "显示当前目录内容",
-  "embedding_model": "nomic-embed-text",
-  "embedding": [...]
-}
-```
-
-特性：
-
-- 同 command 自动合并触发语
-- 语义相似度自动匹配
-- 自动去重
-- TopK 候选排序
-
----
-
-# 六、Embedding 自动升级机制
-
-当你修改：
-
-```json
-"embed_model": "新的模型"
-```
-
-系统会：
-
-1. 自动检测模型变化
-2. 重新计算全部技能向量
-3. 显示重算进度
-4. 若失败 → 自动回滚 skills.json
-
-无需手动操作。
-
----
-
-# 七、系统架构
-
-```
-用户输入
-   ↓
-ai.sh
-   ↓
-skill_manager.py
-   ↓
-Ollama HTTP API
-   ↓
-Embedding 模型
-   ↓
-FAISS 检索
-   ↓
-执行 Shell 命令
-```
-
----
-
-# 八、常见问题
-
-## Q1：embedding 地址是否固定？
-
-默认：
-
-```
-http://localhost:11434/api/embeddings
-```
-
-除非你修改 Ollama 端口，否则无需更改。
-
----
-
-## Q2：如何切换模型？
-
-修改 config.json：
-
-```json
-"chat_model": "新模型"
-```
-
-或：
-
-```json
-"embed_model": "新embedding模型"
-```
-
-系统自动适配。
-
----
+系统会检测并警告，需要输入 `yes` 确认才会执行。
