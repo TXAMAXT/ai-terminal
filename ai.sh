@@ -77,6 +77,9 @@ if [[ "$USER_INPUT" == delete* ]]; then
     echo "  ai delete ls -la"
     echo "  ai delete 帮我执行top命令"
     echo "  ai delete a1b2c3"
+    echo ""
+    echo "⚠️  包含特殊字符（; | & > <）的命令请用引号包裹："
+    echo "  ai delete \"cat file; ip a\""
     exit 1
   fi
 

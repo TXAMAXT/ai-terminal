@@ -88,6 +88,9 @@ ai skill
 ai delete ls -la
 ai delete 帮我执行top命令
 ai delete a1b2c3
+
+# 注意：包含特殊字符（; | & > <）的命令需要用引号包裹
+ai delete "cat /etc/resolv.conf; ip a"
 ```
 
 删除时会显示匹配结果，让用户确认后执行：
@@ -189,6 +192,9 @@ ai skill
 
 ```bash
 ai delete <命令|触发语|ID>
+
+# 包含特殊字符的命令需要引号
+ai delete "cat file; ip a"
 ```
 
 ### Q: 如何切换模型？
