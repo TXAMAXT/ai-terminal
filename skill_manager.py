@@ -48,6 +48,23 @@ def current_embed_model() -> str:
     return cfg.get("embed_model", "nomic-embed-text")
 
 
+def current_language() -> str:
+    """获取当前语言设置"""
+    cfg = load_config()
+    return cfg.get("language", "chinese")
+
+
+def set_language(lang: str) -> bool:
+    """设置语言并保存到配置文件"""
+    if lang not in ("chinese", "english"):
+        return False
+    cfg = load_config()
+    cfg["language"] = lang
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    return True
+
+
 def get_embedding(text: str, model: Optional[str] = None) -> np.ndarray:
     m = model or current_embed_model()
     r = requests.post(
@@ -501,7 +518,7 @@ def search_for_delete(query: str, topk: int = 5) -> List[Tuple[Dict[str, Any], f
     return results
 
 
-def delete_by_id(skill_id: str) -> Tuple[bool, str]:
+def delete_by_id(skill_id: str, lang: str = "chinese") -> Tuple[bool, str]:
     """根据 ID 删除技能"""
     skills, _ = dedupe_skills()
     for s in skills:
@@ -509,7 +526,11 @@ def delete_by_id(skill_id: str) -> Tuple[bool, str]:
             cmd = s.get("command", "")
             skills.remove(s)
             save_skills_atomic(skills)
+            if lang == "english":
+                return True, f"Deleted: {cmd}"
             return True, f"已删除: {cmd}"
+    if lang == "english":
+        return False, f"ID not found: {skill_id}"
     return False, f"未找到 ID: {skill_id}"
 
 
@@ -580,6 +601,7 @@ def main():
 
     p_list = sub.add_parser("list", help="list all skills")
     p_list.add_argument("--limit", type=int, default=50, help="max number of skills to show")
+    p_list.add_argument("--lang", type=str, default="chinese", choices=["chinese", "english"])
 
     p_search_del = sub.add_parser("search-delete", help="search skills for deletion")
     p_search_del.add_argument("query", type=str, nargs="+", help="search query")
@@ -587,6 +609,7 @@ def main():
 
     p_del_id = sub.add_parser("delete-id", help="delete skill by id")
     p_del_id.add_argument("id", type=str, help="skill id to delete")
+    p_del_id.add_argument("--lang", type=str, default="chinese", choices=["chinese", "english"])
 
     p_delete = sub.add_parser("delete", help="delete a skill by command, trigger, or id (legacy)")
     p_delete.add_argument("query", type=str, nargs="*", help="command, trigger phrase, or skill id to delete")
@@ -598,6 +621,9 @@ def main():
 
     p_reembed = sub.add_parser("reembed", help="force re-embed all skills using current embed_model")
     p_reembed.add_argument("--force", action="store_true")
+
+    p_set_lang = sub.add_parser("set-language", help="set language (chinese/english)")
+    p_set_lang.add_argument("lang", type=str, choices=["chinese", "english"])
 
     args = parser.parse_args()
 
@@ -630,15 +656,18 @@ def main():
     if args.cmd == "list":
         skills = list_skills(limit=args.limit)
         if not skills:
-            print("没有技能")
+            no_skill_msg = "No skills" if args.lang == "english" else "没有技能"
+            print(no_skill_msg)
             return
-        print(f"共 {len(skills)} 个技能：")
+        total_msg = f"Total {len(skills)} skills:" if args.lang == "english" else f"共 {len(skills)} 个技能："
+        trigger_label = "Triggers:" if args.lang == "english" else "触发语:"
+        print(total_msg)
         print("-" * 60)
         for s in skills:
             cmd = (s.get("command") or "").replace("\n", " ")
             triggers = ", ".join(s.get("triggers", [])[:3])
             print(f"• {cmd}")
-            print(f"  触发语: {triggers}")
+            print(f"  {trigger_label} {triggers}")
         return
 
     if args.cmd == "search-delete":
@@ -654,7 +683,7 @@ def main():
         return
 
     if args.cmd == "delete-id":
-        ok, msg = delete_by_id(args.id)
+        ok, msg = delete_by_id(args.id, lang=getattr(args, 'lang', 'chinese'))
         print(msg)
         return
 
@@ -680,6 +709,11 @@ def main():
         migrate_skills_inplace(skills)
         reembed_all(skills, force=bool(args.force))
         print("done")
+        return
+
+    if args.cmd == "set-language":
+        ok = set_language(args.lang)
+        print("ok" if ok else "failed")
         return
 
 
